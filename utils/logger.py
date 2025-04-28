@@ -36,21 +36,17 @@ def setup_logger() -> logging.Logger:
 
     # Prevent adding multiple handlers if called again
     if not logger.handlers:
-        formatter = logging.Formatter(config.LOG_FORMAT)
+        # Structured formatter: timestamp, level, module, function, line, message
+        formatter = logging.Formatter(
+            fmt='%(asctime)s | %(levelname)s | %(name)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
 
-        # Console Handler
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(config.LOG_LEVEL)
-        ch.setFormatter(formatter)
-        logger.addHandler(ch)
-
-        # File Handler
+        # File Handler (always enabled)
         try:
-            # Ensure the log directory exists if LOG_FILE includes directories
             log_dir = os.path.dirname(config.LOG_FILE)
             if log_dir and not os.path.exists(log_dir):
                 os.makedirs(log_dir)
-
             fh = logging.FileHandler(config.LOG_FILE, mode='a', encoding='utf-8')
             fh.setLevel(config.LOG_LEVEL)
             fh.setFormatter(formatter)
@@ -59,12 +55,19 @@ def setup_logger() -> logging.Logger:
             logger.error(f"Failed to create file handler for {config.LOG_FILE}: {e}", exc_info=config.DEBUG)
             # Continue without file logging if it fails
 
+        # Console Handler (only if DEBUG)
+        if config.DEBUG:
+            ch = logging.StreamHandler(sys.stdout)
+            ch.setLevel(logging.DEBUG)
+            ch.setFormatter(formatter)
+            logger.addHandler(ch)
+
     _logger = logger
 
     if config.DEBUG:
         logger.debug("Logger initialized in DEBUG mode.")
     else:
-        logger.info("Logger initialized.")
+        logger.info("Logger initialized (file logging only, console suppressed in production mode).")
 
     return logger
 

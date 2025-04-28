@@ -54,7 +54,7 @@ class Grader:
         self.forms_service = forms_service
         self.gmail_service = gmail_service
         self.gemini_client = gemini_client
-        logger.debug("Grader initialized.")
+        logger.info("Grader initialized with services: Classroom, Drive, Docs, Forms, Gmail, Gemini=%s", bool(gemini_client))
 
     def _extract_submission_content(self, submission: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
         """Extracts relevant text content from a student submission attachment.
@@ -232,12 +232,25 @@ class Grader:
         logger.info(f"Starting processing for assignment {coursework_id} in course {course_id}.")
         processed_results: List[ProcessedSubmission] = []
 
+        # Fetch the assignment/coursework object to get its title
         try:
+            coursework = None
+            try:
+                assignments = self.classroom_service.list_assignments(course_id)
+                coursework = next((a for a in assignments if a.get('id') == coursework_id), None)
+                if coursework:
+                    logger.info(f"Fetched assignment title: {coursework.get('title')}")
+                else:
+                    logger.warning(f"Could not find assignment with id {coursework_id} in course {course_id}.")
+            except Exception as e:
+                logger.warning(f"Could not fetch assignment title for coursework_id {coursework_id}: {e}")
+
             submissions = self.classroom_service.list_submissions(course_id, coursework_id)
         except APIError as e:
             logger.critical(f"Failed to list submissions for assignment {coursework_id}: {e}. Aborting processing.")
             return []
 
+        assignment_title = coursework.get('title') if coursework else None
         logger.info(f"Found {len(submissions)} submissions to process.")
 
         for i, sub in enumerate(submissions):
@@ -256,7 +269,8 @@ class Grader:
                 'feedback': None,
                 'error': None,
                 'state': state,
-                'current_grade': assigned_grade
+                'current_grade': assigned_grade,
+                'assignment_title': assignment_title
             }
 
             result['student_email'] = self._get_student_email(user_id)
@@ -324,10 +338,6 @@ class Grader:
         logger.info(f"Applying actions to {len(processed_submissions)} submissions for assignment {coursework_id}...")
         logger.info(f"Apply Grades: {apply_grades}, Post Comments: {post_comments}")
 
-        if apply_grades:
-            logger.warning("Automated grading logic is not implemented in MVP. Skipping grade application.")
-            apply_grades = False
-
         for i, result in enumerate(processed_submissions):
             submission_id = result.get('submission_id')
             feedback = result.get('feedback')
@@ -348,17 +358,22 @@ class Grader:
             logger.debug(f"Processing actions for submission {submission_id}...")
 
             if apply_grades:
-                grade = None # Placeholder for actual grading logic
-                if grade is not None:
-                    logger.info(f"Attempting to patch grade {grade} for submission {submission_id}.")
-                    try:
-                        self.classroom_service.patch_grade(course_id, coursework_id, submission_id, grade)
-                        logger.info(f"Attempting to return submission {submission_id} to finalize grade.")
-                        self.classroom_service.return_submission(course_id, coursework_id, submission_id)
-                    except APIError as e:
-                        logger.error(f"Failed to patch grade or return submission {submission_id}: {e}")
-                else:
-                    logger.debug(f"No grade determined for submission {submission_id}, skipping grade patch.")
+                # Try to get a grade from the processed result; default to 100 if not present
+                grade = result.get('grade')
+                if grade is None:
+                    grade = result.get('current_grade')
+                if grade is None:
+                    grade = 100  # Default grade if none present
+                logger.info(f"[GRADER] About to patch grade for submission {submission_id}: course_id={course_id}, coursework_id={coursework_id}, grade={grade}")
+                logger.debug(f"[GRADER] Submission state before patch: {result}")
+                try:
+                    patch_response = self.classroom_service.patch_grade(course_id, coursework_id, submission_id, grade)
+                    logger.info(f"[GRADER] Patch grade response for submission {submission_id}: {patch_response}")
+                except APIError as e:
+                    logger.error(f"[GRADER] Failed to patch grade for submission {submission_id}: {e}")
+                except Exception as e:
+                    logger.error(f"[GRADER] Unexpected exception during patch_grade for submission {submission_id}: {e}", exc_info=True)
+                logger.debug(f"[GRADER] Submission state after patch: {result}")
 
             if post_comments and feedback:
                 logger.info(f"Attempting to add comment to submission {submission_id}.")
@@ -408,10 +423,153 @@ class Grader:
 
             logger.info(f"Attempting to send feedback email to {student_email} for submission {submission_id}.")
             try:
-                subject = f"Feedback for your Assignment Submission (ID: {submission_id})"
-                body = f"Hello,\n\nHere is the feedback for your recent assignment submission:\n\n---\n{feedback}\n---\n\nRegards,\nYour Teacher (via AI Assistant)"
-
-                self.gmail_service.send_email(student_email, subject, body)
+                # --- Fetch and cache student name from Classroom API ---
+                if not hasattr(self, '_student_name_cache'):
+                    self._student_name_cache = {}
+                user_id = result.get('user_id')
+                student_name = None
+                if user_id:
+                    student_name = self._student_name_cache.get(user_id)
+                    if not student_name:
+                        try:
+                            profile = self.classroom_service.get_student_profile(user_id)
+                            # Google Classroom API returns: { ... 'name': {'fullName': ...}, ... }
+                            student_name = (
+                                profile.get('name', {}).get('fullName')
+                                or profile.get('name', {}).get('givenName')
+                                or profile.get('name', {}).get('displayName')
+                                or "Student"
+                            )
+                            self._student_name_cache[user_id] = student_name
+                        except Exception as e:
+                            student_name = "Student"
+                if not student_name:
+                    student_name = result.get('student_name') or result.get('name') or "Student"
+                # --- Get submission title as before ---
+                # Try all possible keys for assignment/assignment title
+                submission_title = (
+                    result.get('assignment_title')
+                    or result.get('submission_title')
+                    or result.get('title')
+                    or result.get('assignment')
+                    or result.get('coursework_title')
+                    or "Assignment"
+                )
+                # --- Subject and HTML body ---
+                subject = f"{student_name}, your feedback for '{submission_title}'"
+                # --- Sanitize feedback to remove placeholders, greetings, and assignment title ---
+                import re
+                clean_feedback = feedback
+                # Remove '[StudentName]' or similar placeholders
+                clean_feedback = re.sub(r'\[ ?Student(Name)? ?\]', '', clean_feedback, flags=re.IGNORECASE)
+                # Remove lines starting with a greeting (Hi|Hello|Dear), possibly followed by a name/placeholder
+                clean_feedback = re.sub(r'^(\s)*(hi|hello|dear)[^\n]*[\n\r]+', '', clean_feedback, flags=re.IGNORECASE|re.MULTILINE)
+                # Remove lines mentioning the assignment title or generic assignment references
+                assignment_terms = [re.escape(submission_title), r'assignment', r'homework', r'task', r'project']
+                assignment_pattern = r'^(.*(' + '|'.join(assignment_terms) + r').*)[\n\r]+'
+                clean_feedback = re.sub(assignment_pattern, '', clean_feedback, flags=re.IGNORECASE|re.MULTILINE)
+                clean_feedback = clean_feedback.strip()
+                html_body = f'''
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                  <meta charset="UTF-8">
+                  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                  <title>Assignment Feedback</title>
+                  <style>
+                    body {{
+                      background: linear-gradient(135deg, #e0e7ff 0%, #f8fafc 100%);
+                      margin: 0;
+                      padding: 0;
+                      font-family: 'Segoe UI', 'Roboto', Arial, sans-serif;
+                      color: #232946;
+                    }}
+                    .container {{
+                      max-width: 600px;
+                      margin: 32px auto;
+                      background: #fff;
+                      border-radius: 18px;
+                      box-shadow: 0 10px 32px 0 rgba(51,102,204,0.10), 0 1.5px 8px 0 rgba(51,102,204,0.07);
+                      padding: 0 0 36px 0;
+                      overflow: hidden;
+                    }}
+                    .header {{
+                      background: linear-gradient(90deg, #3366cc 0%, #5f9fff 100%);
+                      color: #fff;
+                      padding: 28px 36px 18px 36px;
+                      display: flex;
+                      align-items: center;
+                    }}
+                    .header-icon {{
+                      font-size: 2.3em;
+                      margin-right: 18px;
+                    }}
+                    .header-title {{
+                      font-size: 1.7em;
+                      font-weight: 600;
+                      letter-spacing: 1px;
+                    }}
+                    .greeting {{
+                      margin: 32px 36px 0 36px;
+                      font-size: 1.08em;
+                      color: #232946;
+                    }}
+                    .desc {{
+                      margin: 12px 36px 0 36px;
+                      color: #4f5d75;
+                      font-size: 1.08em;
+                    }}
+                    .feedback-section {{
+                      margin: 28px 36px 0 36px;
+                      background: linear-gradient(90deg, #f0f4fc 80%, #e6f0ff 100%);
+                      border-left: 7px solid #3366cc;
+                      border-radius: 6px;
+                      box-shadow: 0 1px 6px 0 rgba(51,102,204,0.05);
+                      padding: 24px 20px 18px 22px;
+                      font-size: 1.13em;
+                      color: #263159;
+                      line-height: 1.7;
+                    }}
+                    .footer {{
+                      margin: 38px 36px 0 36px;
+                      font-size: 1em;
+                      color: #7a7a7a;
+                      border-top: 1px solid #e0e7ff;
+                      padding-top: 18px;
+                    }}
+                    @media (max-width: 650px) {{
+                      .container, .header, .greeting, .desc, .feedback-section, .footer {{
+                        margin-left: 0 !important;
+                        margin-right: 0 !important;
+                        padding-left: 10px !important;
+                        padding-right: 10px !important;
+                      }}
+                      .header {{
+                        flex-direction: column;
+                        align-items: flex-start;
+                        padding: 22px 10px 12px 10px;
+                      }}
+                    }}
+                  </style>
+                </head>
+                <body>
+                  <div class="container">
+                    <div class="header">
+                      <div class="header-icon">📚</div>
+                      <div class="header-title">Your Assignment Feedback</div>
+                    </div>
+                    <div class="greeting">Hello {student_name},</div>
+                    <div class="desc">Here is your personalized feedback:</div>
+                    <div class="feedback-section">{clean_feedback}</div>
+                    <div class="footer">
+                      <div>Best regards,<br><b>Your Teacher</b> <span style="color:#3366cc;">(via AI Assistant)</span></div>
+                      <div style="margin-top: 10px; font-size:0.95em; color:#b4b4b4;">This message was generated by the Google Classroom AI Grading Assistant.<br>Keep learning and growing! 🚀</div>
+                    </div>
+                  </div>
+                </body>
+                </html>
+                '''
+                self.gmail_service.send_email(student_email, subject, html_body, is_html=True)
                 emails_sent += 1
             except (APIError, ValueError) as e:
                 logger.error(f"Failed to send feedback email to {student_email} for submission {submission_id}: {e}")

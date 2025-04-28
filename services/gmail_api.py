@@ -6,6 +6,7 @@ import base64
 from email.mime.text import MIMEText
 from typing import Any, Dict
 
+
 from googleapiclient.discovery import Resource
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
@@ -57,19 +58,23 @@ class GmailService:
         self.service: Resource = build_service(self.SERVICE_NAME, self.VERSION, credentials)
         logger.debug("GmailService initialized successfully.")
 
-    def _create_message(self, sender: str, to: str, subject: str, message_text: str) -> Dict[str, str]:
+    def _create_message(self, sender: str, to: str, subject: str, message_text: str, is_html: bool = False) -> Dict[str, str]:
         """Creates a MIME message structure for sending an email.
 
         Args:
             sender: The sender's email address (usually "me").
             to: The recipient's email address.
             subject: The subject of the email.
-            message_text: The plain text body of the email.
+            message_text: The body of the email (plain text or HTML).
+            is_html: If True, message_text is treated as HTML.
 
         Returns:
             A dictionary containing the base64url encoded raw message string.
         """
-        message = MIMEText(message_text)
+        if is_html:
+            message = MIMEText(message_text, 'html')
+        else:
+            message = MIMEText(message_text)
         message['to'] = to
         # If sender is "me", Gmail API usually fills in the correct address.
         # Explicitly setting it might be necessary in some contexts or cause issues in others.
@@ -81,14 +86,15 @@ class GmailService:
         return {'raw': raw_message}
 
     @retry_on_exception(exceptions=RETRYABLE_GMAIL_ERRORS, max_attempts=3)
-    def send_email(self, to_email: str, subject: str, body: str, sender: str = "me") -> Dict[str, Any]:
+    def send_email(self, to_email: str, subject: str, body: str, sender: str = "me", is_html: bool = False) -> Dict[str, Any]:
         """Sends an email using the authenticated user's account.
 
         Args:
             to_email: The recipient's email address.
             subject: The email subject.
-            body: The plain text email body.
+            body: The email body (plain text or HTML).
             sender: The sender's email address (defaults to "me").
+            is_html: If True, body is treated as HTML and sent as a rich email.
 
         Returns:
             The response from the Gmail API's send method (contains message ID).
@@ -100,10 +106,10 @@ class GmailService:
         if not to_email or '@' not in to_email:
             raise ValueError(f"Invalid recipient email address: {to_email}")
 
-        logger.info(f"Preparing to send email to <{to_email}> with subject: '{subject}'")
+        logger.info(f"Preparing to send email to <{to_email}> with subject: '{subject}' (HTML: {is_html})")
 
         try:
-            message_body = self._create_message(sender, to_email, subject, body)
+            message_body = self._create_message(sender, to_email, subject, body, is_html=is_html)
 
             sent_message = self.service.users().messages().send(
                 userId=sender,

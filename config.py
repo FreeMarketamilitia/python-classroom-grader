@@ -64,8 +64,10 @@ Provide personalized feedback for the student:"""
 DEFAULT_PAGE_SIZE: Final[int] = 50 # As per MVP requirements
 
 # --- Logging Configuration ---
+# LOG_LEVEL is used for file logging, console logging is only enabled in DEBUG mode
 LOG_LEVEL = logging.DEBUG if DEBUG else logging.INFO
-LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Structured log format: timestamp, level, logger, module.function:line, message
+LOG_FORMAT = '%(asctime)s | %(levelname)s | %(name)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s'
 
 # Basic check
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import subprocess
 from typing import List, Optional
 
 from google.auth.transport.requests import Request
@@ -43,11 +44,20 @@ def get_credentials() -> Credentials:
     """
     creds: Optional[Credentials] = None
 
+    logger.info(f"Checking for credentials file: {config.CLIENT_SECRETS_FILE}")
+    if not os.path.exists(config.CLIENT_SECRETS_FILE):
+        logger.critical(f"Missing credentials file: {config.CLIENT_SECRETS_FILE}")
+    else:
+        logger.info(f"Found credentials file: {config.CLIENT_SECRETS_FILE}")
+    logger.info(f"Checking for token file: {config.TOKEN_FILE}")
     # --- 1. Check for existing token file ---
     if os.path.exists(config.TOKEN_FILE):
         try:
             creds = Credentials.from_authorized_user_file(config.TOKEN_FILE, config.SCOPES)
             logger.debug(f"Loaded credentials from {config.TOKEN_FILE}")
+            logger.debug(f"Token scopes: {creds.scopes}")
+            if hasattr(creds, 'id_token') and creds.id_token:
+                logger.info(f"Token contains id_token (user may be: {getattr(creds, 'id_token', None)})")
         except ValueError as e:
             logger.warning(f"Error loading token file {config.TOKEN_FILE}: {e}. Proceeding with re-authentication.")
             creds = None # Force re-authentication
@@ -57,33 +67,35 @@ def get_credentials() -> Credentials:
 
     # --- 2. Check if credentials are valid or need refresh ---
     if creds and creds.valid:
-        logger.info("Credentials are valid.")
-        # Check if refresh is needed (optional, but good practice)
-        if creds.expired and creds.refresh_token:
-            logger.info("Credentials expired, attempting refresh...")
+        logger.info("Credentials are valid. Using cached token; skipping re-authentication.")
+        logger.debug(f"Authenticated user: {getattr(creds, 'username', None) or getattr(creds, 'client_id', None)}")
+        return creds
+    # If credentials are expired but can be refreshed, refresh them
+    if creds and creds.expired and creds.refresh_token:
+        logger.info("Credentials expired, attempting refresh...")
+        try:
+            creds.refresh(Request())
+            logger.info("Credentials refreshed successfully.")
+            # Save the refreshed credentials
             try:
-                creds.refresh(Request())
-                logger.info("Credentials refreshed successfully.")
-                # Save the refreshed credentials
-                try:
-                    with open(config.TOKEN_FILE, "w") as token_file:
-                        token_file.write(creds.to_json())
-                    logger.debug(f"Refreshed token saved to {config.TOKEN_FILE}")
-                except IOError as e:
-                    logger.warning(f"Failed to save refreshed token to {config.TOKEN_FILE}: {e}")
-            except HttpError as e:
-                logger.error(f"Credentials refresh failed with HTTP error: {e.resp.status} {e.content}", exc_info=config.DEBUG)
-                # Delete potentially corrupted token file and force re-auth
-                if os.path.exists(config.TOKEN_FILE):
-                    os.remove(config.TOKEN_FILE)
-                raise AuthenticationError(f"Failed to refresh token: {e.resp.status} Error. Please re-authenticate.") from e
-            except Exception as e:
-                logger.error(f"Credentials refresh failed unexpectedly: {e}", exc_info=config.DEBUG)
-                # Delete potentially corrupted token file and force re-auth
-                if os.path.exists(config.TOKEN_FILE):
-                    os.remove(config.TOKEN_FILE)
-                raise AuthenticationError(f"Failed to refresh token due to an unexpected error. Please re-authenticate.") from e
-        return creds # Return valid (potentially refreshed) credentials
+                with open(config.TOKEN_FILE, "w") as token_file:
+                    token_file.write(creds.to_json())
+                logger.debug(f"Refreshed token saved to {config.TOKEN_FILE}")
+            except IOError as e:
+                logger.warning(f"Failed to save refreshed token to {config.TOKEN_FILE}: {e}")
+            return creds
+        except HttpError as e:
+            logger.error(f"Credentials refresh failed with HTTP error: {e.resp.status} {e.content}", exc_info=config.DEBUG)
+            # Delete potentially corrupted token file and force re-auth
+            if os.path.exists(config.TOKEN_FILE):
+                os.remove(config.TOKEN_FILE)
+            raise AuthenticationError(f"Failed to refresh token: {e.resp.status} Error. Please re-authenticate.") from e
+        except Exception as e:
+            logger.error(f"Credentials refresh failed unexpectedly: {e}", exc_info=config.DEBUG)
+            # Delete potentially corrupted token file and force re-auth
+            if os.path.exists(config.TOKEN_FILE):
+                os.remove(config.TOKEN_FILE)
+            raise AuthenticationError(f"Failed to refresh token due to an unexpected error. Please re-authenticate.") from e
 
     # --- 3. Run authorization flow if no valid credentials ---
     if not creds or not creds.valid:
@@ -101,17 +113,19 @@ def get_credentials() -> Credentials:
             flow = InstalledAppFlow.from_client_secrets_file(
                 config.CLIENT_SECRETS_FILE, config.SCOPES
             )
-            # port=0 selects a random available port
-            # Force port 8081 as requested
+            logger.info("No valid credentials found or refresh needed. Starting OAuth flow...")
+            # Kill any process using port 8081 to avoid address in use errors
+            try:
+                logger.info("Checking for existing process on port 8081 and killing if found...")
+                kill_cmd = "lsof -ti tcp:8081 | xargs -r kill -9"
+                subprocess.run(kill_cmd, shell=True, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                logger.info("Any process using port 8081 has been killed (if any existed).")
+            except Exception as kill_err:
+                logger.warning(f"Failed to kill process on port 8081: {kill_err}")
+            # Run OAuth flow to get new credentials
             logger.info("Running local server for OAuth on port 8081...")
-            creds = flow.run_local_server(port=8081) 
+            creds = flow.run_local_server(port=8081)
             logger.info("Authentication successful.")
-        except FileNotFoundError:
-             logger.critical(f"CRITICAL: {config.CLIENT_SECRETS_FILE} not found during OAuth flow.")
-             raise
-        except ValueError as e:
-            logger.critical(f"CRITICAL: {config.CLIENT_SECRETS_FILE} seems improperly formatted: {e}")
-            raise AuthenticationError(f"Invalid format in {config.CLIENT_SECRETS_FILE}: {e}") from e
         except Exception as e:
             logger.error(f"OAuth flow failed unexpectedly: {e}", exc_info=config.DEBUG)
             raise AuthenticationError(f"OAuth flow failed: {e}") from e

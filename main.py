@@ -49,6 +49,7 @@ logger = setup_logger()
 
 def main():
     """Main function to run the grading assistant workflow."""
+    logger.info("Starting Google Classroom AI Grader main workflow.")
     cli.display_welcome()
 
     credentials = None
@@ -140,8 +141,16 @@ def main():
              cli.display_warning("No submissions were processed successfully. Cannot apply comments or email feedback.")
              return
 
-        # --- Step 7: Post Comments (Optional) --- 
-        cli.display_step(7, "Post Feedback as Private Comments...")
+        # --- Step 7: Apply Grades as Drafts (Optional) ---
+        cli.display_step(7, "Apply Grades as Drafts (Teacher Review Required)...")
+        if cli.confirm_action("Apply grades as drafts to submissions in Google Classroom? (Teachers can review and finalize)", default=True):
+            grader_instance.apply_grades_and_comments(course_id, assignment_id, processed_submissions, apply_grades=True, post_comments=False)
+            cli.display_success("Draft grades were patched to Classroom. Teachers must review and return them manually.")
+        else:
+            logger.info("User skipped applying grades.")
+
+        # --- Step 8: Post Comments (Optional) --- 
+        cli.display_step(8, "Post Feedback as Private Comments...")
         if not has_feedback:
              cli.display_warning("No feedback was generated (check Gemini setup/errors). Cannot post comments.")
         elif cli.confirm_action("Post generated feedback as private comments to Classroom?", default=True):

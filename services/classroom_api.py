@@ -54,9 +54,9 @@ class ClassroomService:
             AuthenticationError: If credentials are invalid.
             APIError: If the Classroom service cannot be built.
         """
-        logger.debug("Initializing ClassroomService...")
+        logger.info("Initializing ClassroomService with credentials: %s", credentials.service_account_email if hasattr(credentials, 'service_account_email') else 'user')
         self.service: Resource = build_service(self.SERVICE_NAME, self.VERSION, credentials)
-        logger.debug("ClassroomService initialized successfully.")
+        logger.info("ClassroomService initialized successfully.")
 
     @retry_on_exception(exceptions=RETRYABLE_CLASSROOM_ERRORS, max_attempts=3)
     def list_courses(self, page_size: int = config.DEFAULT_PAGE_SIZE) -> List[Dict[str, Any]]:
@@ -229,7 +229,7 @@ class ClassroomService:
             body = {
                 'assignedGrade': float(grade) # Ensure grade is a float
             }
-            # Use PATCH method
+            logger.debug(f"[PATCH_GRADE] course_id={course_id}, coursework_id={coursework_id}, submission_id={submission_id}, grade={grade}, body={body}")
             request = self.service.courses().courseWork().studentSubmissions().patch(
                 courseId=course_id,
                 courseWorkId=coursework_id,
@@ -238,7 +238,7 @@ class ClassroomService:
                 body=body
             )
             response = request.execute()
-            logger.info(f"Successfully patched grade for submission {submission_id} to {grade}.")
+            logger.info(f"Successfully patched grade for submission {submission_id} to {grade}. Response: {response}")
             return response
         except HttpError as e:
             logger.error(f"Failed to patch grade for submission {submission_id}: {e.resp.status} {e.content}", exc_info=config.DEBUG)
