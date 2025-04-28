@@ -1,0 +1,6 @@
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+google-generativeai
+python-dotenv # Optional: For loading .env file during development
+rich # Optional: For better CLI output
