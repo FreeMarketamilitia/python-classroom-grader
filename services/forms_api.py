@@ -36,6 +36,11 @@ def should_retry_forms(e: Exception) -> bool:
     return isinstance(e, (TimeoutError, ConnectionError))
 
 class FormsService:
+    """
+    Provides methods to interact with the Google Forms API.
+    SOLID-compliant: All logic for fetching, parsing, and matching Google Form responses is encapsulated here.
+    """
+
     """Provides methods to interact with the Google Forms API."""
 
     SERVICE_NAME = 'forms'
@@ -200,6 +205,117 @@ class FormsService:
             logger.error(f"Unexpected error parsing form and responses for {form_id}: {e}", exc_info=True)
             raise ContentExtractionError(f"Failed to parse form/responses for {form_id}: {e}") from e
 
+    def get_form_questions_and_correct_answers(self, form_structure: Dict[str, Any]) -> List[Dict[str, Any]]:
+        logger.debug(f"[get_form_questions_and_correct_answers] Called with form_structure keys: {list(form_structure.keys()) if isinstance(form_structure, dict) else type(form_structure)}")
+        questions = []
+        """
+        Extracts all questions and their correct answers (if present) from the form structure.
+        Args:
+            form_structure: The dictionary representing the form structure (from get_form).
+        Returns:
+            A list of dictionaries, each with keys: 'question_id', 'question_text', 'correct_answers' (if quiz), 'type'.
+        """
+        questions = []
+        for idx, item in enumerate(form_structure.get('items', [])):
+            logger.debug(f"[get_form_questions_and_correct_answers] Processing item {idx}: keys={list(item.keys())}")
+            if 'questionItem' in item:
+                q = item['questionItem']['question']
+                logger.debug(f"[get_form_questions_and_correct_answers] Question object: {q}")
+                question_id = q.get('questionId', item.get('itemId'))
+                question_text = item.get('title', '')
+                q_type = q.get('questionType', 'UNKNOWN')
+                correct_answers = None
+                if 'grading' in q:
+                    correct_answers = q['grading'].get('correctAnswers')
+                    logger.debug(f"[get_form_questions_and_correct_answers] Found grading: {q['grading']}")
+                questions.append({
+                    'question_id': question_id,
+                    'question_text': question_text,
+                    'type': q_type,
+                    'correct_answers': correct_answers
+                })
+                logger.debug(f"[get_form_questions_and_correct_answers] Appended question: id={question_id}, text={question_text}, type={q_type}, correct_answers={correct_answers}")
+        logger.debug(f"[get_form_questions_and_correct_answers] Returning {len(questions)} questions.")
+        return questions
+
+    def match_responses_to_emails(self, form_responses: List[Dict[str, Any]], student_emails: List[str]) -> Dict[str, Dict[str, Any]]:
+        logger.debug(f"[match_responses_to_emails] Called with {len(form_responses)} responses and {len(student_emails)} student emails.")
+        logger.debug(f"[match_responses_to_emails] Student emails: {student_emails}")
+        email_to_response = {}
+        """
+        Matches each form response to a student email (if email collection is enabled).
+        Args:
+            form_responses: List of form response dicts.
+            student_emails: List of student email addresses from Classroom.
+        Returns:
+            Dict mapping student_email -> form_response (if found).
+        """
+        email_to_response = {}
+        for idx, response in enumerate(form_responses):
+            respondent_email = response.get('respondentEmail')
+            logger.debug(f"[match_responses_to_emails] Response {idx}: respondent_email={respondent_email}")
+            if respondent_email and respondent_email in student_emails:
+                logger.debug(f"[match_responses_to_emails] Matched respondent_email={respondent_email}")
+                email_to_response[respondent_email] = response
+            else:
+                logger.debug(f"[match_responses_to_emails] No match for respondent_email={respondent_email}")
+        logger.debug(f"[match_responses_to_emails] Returning {len(email_to_response)} matched responses.")
+        return email_to_response
+
+    def extract_student_form_data(self, form_structure: Dict[str, Any], form_response: Dict[str, Any]) -> Dict[str, Any]:
+        logger.debug(f"[extract_student_form_data] Called with form_structure keys: {list(form_structure.keys()) if isinstance(form_structure, dict) else type(form_structure)}, form_response keys: {list(form_response.keys()) if isinstance(form_response, dict) else type(form_response)}")
+        questions_meta = self.get_form_questions_and_correct_answers(form_structure)
+        logger.debug(f"[extract_student_form_data] Extracted {len(questions_meta)} questions from form_structure.")
+        answers = form_response.get('answers', {})
+        logger.debug(f"[extract_student_form_data] Answers keys: {list(answers.keys()) if isinstance(answers, dict) else type(answers)}")
+        result = {
+            'respondent_email': form_response.get('respondentEmail'),
+            'response_id': form_response.get('responseId'),
+            'questions': [],
+            'score': form_response.get('totalScore'),
+        }
+        """
+        Extracts structured Q&A data for a single student response.
+        Args:
+            form_structure: The dictionary representing the form structure (from get_form).
+            form_response: The dictionary representing a single student's response.
+        Returns:
+            Dict with keys: 'questions' (list of dicts with question_id, question_text, student_answer, correct_answer, is_correct), 'score', 'respondent_email'.
+        """
+        questions_meta = self.get_form_questions_and_correct_answers(form_structure)
+        answers = form_response.get('answers', {})
+        result = {
+            'respondent_email': form_response.get('respondentEmail'),
+            'response_id': form_response.get('responseId'),
+            'questions': [],
+            'score': form_response.get('totalScore'),
+        }
+        for idx, q in enumerate(questions_meta):
+            qid = q['question_id']
+            logger.debug(f"[extract_student_form_data] Processing question {idx}: id={qid}, text={q['question_text']}")
+            student_answer = None
+            if qid in answers:
+                text_answers = answers[qid].get('textAnswers', {}).get('answers', [])
+                logger.debug(f"[extract_student_form_data] Found text_answers for qid={qid}: {text_answers}")
+                student_answer = [a.get('value') for a in text_answers if 'value' in a]
+            else:
+                logger.debug(f"[extract_student_form_data] No answer for qid={qid}")
+            correct = None
+            if q['correct_answers']:
+                correct = q['correct_answers'].get('answers')
+                logger.debug(f"[extract_student_form_data] Correct answers for qid={qid}: {correct}")
+            is_correct = (student_answer == correct) if (student_answer and correct) else None
+            logger.debug(f"[extract_student_form_data] Result for qid={qid}: student_answer={student_answer}, correct={correct}, is_correct={is_correct}")
+            result['questions'].append({
+                'question_id': qid,
+                'question_text': q['question_text'],
+                'student_answer': student_answer,
+                'correct_answer': correct,
+                'is_correct': is_correct
+            })
+        logger.debug(f"[extract_student_form_data] Returning result: {result}")
+        return result
+
     def format_responses_for_llm(self, form_structure: Dict[str, Any], form_responses: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         """Formats form questions and individual student responses into a text format suitable for an LLM.
 
@@ -230,6 +346,19 @@ class FormsService:
                 question_id = question_info.get('questionId', item_id)
 
                 output_text += f"Q: {question_title}\n"
+
+                # List options for choice questions
+                cq = question_info.get('choiceQuestion', {})
+                opts = cq.get('options', [])
+                if opts:
+                    values = [opt.get('value', '') for opt in opts]
+                    output_text += f"Options: {', '.join(values)}\n"
+                # List correct answer(s) if quiz grading exists
+                grading = question_info.get('grading', {})
+                ca = grading.get('correctAnswers', {}).get('answers', [])
+                if ca:
+                    correct_vals = [ans.get('value', '') for ans in ca]
+                    output_text += f"Correct Answer: {', '.join(correct_vals)}\n"
 
                 answer_data = answers.get(question_id)
                 if answer_data:

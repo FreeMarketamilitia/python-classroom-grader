@@ -3,6 +3,8 @@
 import sys
 import os
 import textwrap
+import json
+import re
 from typing import List, Dict, Any, Optional, Tuple
 
 # Assuming common setup is done correctly
@@ -57,149 +59,191 @@ class Grader:
         logger.info("Grader initialized with services: Classroom, Drive, Docs, Forms, Gmail, Gemini=%s", bool(gemini_client))
 
     def _extract_submission_content(self, submission: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-        """Extracts relevant text content from a student submission attachment.
-
-        Supports Google Drive files (Docs, Sheets, Slides exported as text),
-        direct Google Docs attachments, and Google Forms.
-
-        Args:
-            submission: The student submission object from Classroom API.
-
-        Returns:
-            A tuple containing:
-            - The extracted text content (or a formatted representation for Forms).
-            - An error message string if extraction failed, None otherwise.
+        """
+        Extracts relevant text content from a student submission attachment, supporting Google Drive files, Docs, Forms, and links.
+        Uses a unified handler registry for extensibility and robust error aggregation.
         """
         submission_id = submission.get('id')
         user_id = submission.get('userId')
-        attachments = submission.get('assignmentSubmission', {}).get('attachments', [])
+        logger.debug(f"Extracting content for submission {submission_id} (user {user_id})")
+        logger.debug(f"RAW submission object: {json.dumps(submission, indent=2)}")
+
+        # Gather all attachments: student + assignment-level
+        attachments = list(submission.get('assignmentSubmission', {}).get('attachments', []))
+        logger.debug(f"Student-level attachments: {submission.get('assignmentSubmission', {}).get('attachments', [])}")
+        assignment_attachments = []
+        if not attachments:
+            # Try to get assignment-level attachments from submission or context
+            if 'courseWork' in submission:
+                assignment_attachments = submission['courseWork'].get('materials', [])
+            elif 'assignment_attachments' in submission:
+                assignment_attachments = submission['assignment_attachments']
+            elif hasattr(self, 'current_assignment') and self.current_assignment:
+                assignment_attachments = self.current_assignment.get('materials', [])
+        logger.debug(f"Assignment-level attachments: {assignment_attachments}")
+        attachments += assignment_attachments
 
         if not attachments:
-            logger.warning(f"Submission {submission_id} for user {user_id} has no attachments.")
-            return None, "No attachments found"
+            logger.warning(f"Submission {submission_id} for user {user_id} has no attachments (student or assignment-level).")
+            return None, "No attachments found."
 
-        # Prioritize the first relevant attachment found (Doc > Form > DriveFile)
-        content: Optional[str] = None
-        error_message: Optional[str] = None
+        # Handler registry: list of (predicate, handler) tuples
+        def is_drive_file(att):
+            return 'driveFile' in att
+        def is_form(att):
+            return 'form' in att
+        def is_link(att):
+            return 'link' in att
+        # Add new handler predicates here as needed
 
-        for attachment in attachments:
-            if attachment.get('driveFile'):
-                drive_file = attachment['driveFile']
-                file_id = drive_file.get('id')
-                file_title = drive_file.get('title', 'Untitled Drive File')
-                if not file_id:
-                    continue
-
-                logger.info(f"Processing Drive file attachment: '{file_title}' (ID: {file_id}) for submission {submission_id}.")
-                try:
-                    mime_type, file_bytes = self.drive_service.download_file_content(file_id)
-                    if file_bytes:
-                        if mime_type and mime_type.startswith("text/"):
-                            try:
-                                content = file_bytes.decode('utf-8')
-                            except UnicodeDecodeError:
-                                try:
-                                    content = file_bytes.decode('latin-1')
-                                except UnicodeDecodeError:
-                                     logger.warning(f"Could not decode Drive file {file_id} ('{file_title}') as text.")
-                                     error_message = f"Could not decode file '{file_title}' as text."
-                                     continue
-                        else:
-                            logger.warning(f"Drive file '{file_title}' (ID: {file_id}) is not text (MIME: {mime_type}). Cannot extract content for AI.")
-                            error_message = f"File '{file_title}' is not a text-based document."
-                            continue
-                    else:
-                         logger.warning(f"Downloaded empty content for Drive file {file_id} ('{file_title}').")
-                         error_message = f"File '{file_title}' is empty."
-                         continue
-
-                    if content:
-                        return content, None
-
-                except (APIError, ContentExtractionError) as e:
-                    logger.error(f"Failed to download/extract Drive file {file_id} ('{file_title}'): {e}", exc_info=config.DEBUG)
-                    error_message = f"Error accessing Drive file '{file_title}': {e}"
-                    continue
-                except Exception as e:
-                    logger.error(f"Unexpected error processing Drive file {file_id} ('{file_title}'): {e}", exc_info=True)
-                    error_message = f"Unexpected error with Drive file '{file_title}': {e}"
-                    continue
-
-            elif attachment.get('form'):
-                form_response_info = attachment['form']
-                form_url = form_response_info.get('formUrl')
-                response_url = form_response_info.get('responseUrl')
-                form_title = form_response_info.get('title', 'Untitled Form')
-
-                if not form_url:
-                     logger.warning(f"Form attachment for submission {submission_id} is missing formUrl.")
-                     error_message = "Form attachment has no URL."
-                     continue
-                try:
-                    form_id = form_url.split('/d/')[1].split('/')[1]
-                except IndexError:
-                    logger.error(f"Could not extract form ID from URL: {form_url}")
-                    error_message = f"Could not parse Form ID from URL."
-                    continue
-
-                logger.info(f"Processing Form attachment: '{form_title}' (ID: {form_id}) for submission {submission_id}.")
-                try:
-                    form_structure, all_responses = self.forms_service.parse_form_and_responses(form_id)
-                    target_response_id = None
-                    if response_url and '/viewresponse?id=' in response_url:
+        def handle_drive_file(att):
+            drive_file = att['driveFile']
+            file_id = drive_file.get('id')
+            file_title = drive_file.get('title', 'Untitled Drive File')
+            if not file_id:
+                return None, "Drive file missing file ID."
+            logger.info(f"Processing Drive file attachment: '{file_title}' (ID: {file_id}) for submission {submission_id}.")
+            try:
+                mime_type, file_bytes = self.drive_service.download_file_content(file_id)
+                if not file_bytes:
+                    return None, f"File '{file_title}' is empty."
+                if mime_type and mime_type.startswith("text/"):
+                    try:
+                        content = file_bytes.decode('utf-8')
+                    except UnicodeDecodeError:
                         try:
-                            target_response_id = response_url.split('id=')[1].split('&')[0]
-                            logger.debug(f"Extracted target response ID from URL: {target_response_id}")
-                        except IndexError:
-                             logger.warning(f"Could not parse response ID from responseUrl: {response_url}")
+                            content = file_bytes.decode('latin-1')
+                        except UnicodeDecodeError:
+                            return None, f"Could not decode file '{file_title}' as text."
+                else:
+                    return None, f"File '{file_title}' is not a text-based document (MIME: {mime_type})."
+                return content, None
+            except (APIError, ContentExtractionError) as e:
+                return None, f"Error accessing Drive file '{file_title}': {e}"
+            except Exception as e:
+                return None, f"Unexpected error with Drive file '{file_title}': {e}"
 
-                    matching_responses = []
-                    if target_response_id:
-                        matching_responses = [r for r in all_responses if r.get('responseId') == target_response_id]
-                        if not matching_responses:
-                            logger.warning(f"Could not find response with ID {target_response_id} in the list of all responses for form {form_id}.")
-                            error_message = f"Could not find specific response {target_response_id} for form '{form_title}'."
-                            continue
+        def handle_form(att):
+            form_response_info = att['form']
+            form_url = form_response_info.get('formUrl')
+            response_url = form_response_info.get('responseUrl')
+            form_title = form_response_info.get('title', 'Untitled Form')
+            if not form_url:
+                return None, "Form attachment has no URL."
+            # Parse form ID from URL
+            match = re.search(r'/d/([^/]+)', form_url)
+            if not match:
+                return None, f"Could not parse Form ID from URL: {form_url}"
+            form_id = match.group(1)
+            logger.info(f"Processing Form attachment: '{form_title}' (ID: {form_id}) for submission {submission_id}.")
+            try:
+                form_structure, all_responses = self.forms_service.parse_form_and_responses(form_id)
+                student_email = submission.get('student_email')
+                matching_response = None
+                if student_email:
+                    email_to_response = self.forms_service.match_responses_to_emails(all_responses, [student_email])
+                    matching_response = email_to_response.get(student_email)
+                if not matching_response and response_url and '/viewresponse?id=' in response_url:
+                    try:
+                        target_response_id = response_url.split('id=')[1].split('&')[0]
+                        logger.debug(f"Extracted target response ID from URL: {target_response_id}")
+                        matching_response = next((r for r in all_responses if r.get('responseId') == target_response_id), None)
+                    except Exception:
+                        logger.warning(f"Could not parse or match response ID from responseUrl: {response_url}")
+                if not matching_response:
+                    logger.warning(f"No matching response found for student {student_email} in form {form_id}. Using all responses for debug.")
+                    matching_responses = all_responses
+                else:
+                    matching_responses = [matching_response]
+                if not matching_responses:
+                    return None, f"No responses found or matched for form '{form_title}'."
+                extracted_form_data = [
+                    self.forms_service.extract_student_form_data(form_structure, resp)
+                    for resp in matching_responses
+                ]
+                submission['form_response_data'] = extracted_form_data
+                formatted_responses = self.forms_service.format_responses_for_llm(form_structure, matching_responses)
+                if formatted_responses:
+                    if len(formatted_responses) > 1:
+                        logger.warning(f"Multiple responses formatted for form {form_id} (submission {submission_id}). Combining text.")
+                        content = "\n\n---\n\n".join([fr['formatted_text'] for fr in formatted_responses])
                     else:
-                         logger.warning(f"No specific response ID found for form {form_id} submission {submission_id}. Formatting all responses.")
-                         matching_responses = all_responses
+                        content = formatted_responses[0]['formatted_text']
+                    return content, None
+                else:
+                    return None, f"Failed to format responses for form '{form_title}'."
+            except (APIError, ContentExtractionError) as e:
+                return None, f"Error accessing form '{form_title}': {e}"
+            except Exception as e:
+                return None, f"Unexpected error with form '{form_title}': {e}"
 
-                    if not matching_responses:
-                         error_message = f"No responses found or matched for form '{form_title}'."
-                         continue
-
-                    formatted_responses = self.forms_service.format_responses_for_llm(form_structure, matching_responses)
-                    if formatted_responses:
-                        if len(formatted_responses) > 1:
-                            logger.warning(f"Multiple responses formatted for form {form_id} (submission {submission_id}) without specific ID. Combining text.")
-                            content = "\n\n---\n\n".join([fr['formatted_text'] for fr in formatted_responses])
-                        else:
-                            content = formatted_responses[0]['formatted_text']
-                        return content, None
+        def handle_link(att):
+            link = att['link']
+            url = link.get('url')
+            title = link.get('title', 'Untitled Link')
+            logger.info(f"Processing link attachment: '{title}' ({url}) for submission {submission_id}.")
+            doc_id = None
+            # Try Google Docs/Sheets/Slides
+            if url and ('docs.google.com/document' in url or 'docs.google.com' in url):
+                try:
+                    doc_id = url.split('/d/')[1].split('/')[0]
+                except Exception:
+                    return None, f"Could not extract doc ID from link: {url}"
+            if doc_id:
+                try:
+                    logger.info(f"Attempting to fetch content from Google Doc link (ID: {doc_id})")
+                    doc_content = self.docs_service.get_document_text(doc_id)
+                    if doc_content:
+                        return doc_content, None
                     else:
-                         error_message = f"Failed to format responses for form '{form_title}'."
-                         continue
-
+                        return None, f"Google Doc link '{title}' is empty or could not be read."
                 except (APIError, ContentExtractionError) as e:
-                    logger.error(f"Failed to fetch/parse form {form_id} ('{form_title}'): {e}", exc_info=config.DEBUG)
-                    error_message = f"Error accessing form '{form_title}': {e}"
-                    continue
+                    return None, f"Error accessing Google Doc link '{title}': {e}"
                 except Exception as e:
-                    logger.error(f"Unexpected error processing Form {form_id} ('{form_title}'): {e}", exc_info=True)
-                    error_message = f"Unexpected error with form '{form_title}': {e}"
-                    continue
+                    return None, f"Unexpected error processing Google Doc link '{title}': {e}"
+            return None, f"Link attachment '{title}' not supported or not a Google Doc."
 
-            elif attachment.get('link'):
-                 link = attachment['link']
-                 url = link.get('url')
-                 title = link.get('title', 'Untitled Link')
-                 logger.warning(f"Submission {submission_id} has a link attachment ('{title}': {url}). Link processing not supported in MVP.")
-                 error_message = f"Link attachment '{title}' not supported."
-                 continue
+        handler_registry = [
+            (is_drive_file, handle_drive_file),
+            (is_form, handle_form),
+            (is_link, handle_link),
+            # Add new (predicate, handler) pairs here for extensibility
+        ]
 
-        logger.warning(f"Could not extract processable content from any attachment for submission {submission_id}.")
-        final_error = error_message or "No supported attachment type found or content extracted."
-        return None, final_error
+        extraction_results = []
+        error_details = []
+        for att in attachments:
+            handled = False
+            for predicate, handler in handler_registry:
+                if predicate(att):
+                    content, error = handler(att)
+                    handled = True
+                    if content:
+                        extraction_results.append(content)
+                    else:
+                        error_details.append(f"Attachment {self._describe_attachment(att)}: {error}")
+                    break
+            if not handled:
+                error_details.append(f"Attachment {self._describe_attachment(att)}: No handler found.")
+        if extraction_results:
+            # Join multiple valid extractions with separator
+            return "\n\n---\n\n".join(extraction_results), None
+        else:
+            logger.warning(f"No supported attachment type found or content extracted for submission {submission_id}. Errors: {error_details}")
+            return None, "No supported attachment type found or content extracted. Details:\n" + "\n".join(error_details)
+
+    def _describe_attachment(self, att: Dict[str, Any]) -> str:
+        if 'driveFile' in att:
+            f = att['driveFile']
+            return f"DriveFile[{f.get('title','untitled')}:{f.get('id','no-id')}]"
+        if 'form' in att:
+            f = att['form']
+            return f"Form[{f.get('title','untitled')}]"
+        if 'link' in att:
+            f = att['link']
+            return f"Link[{f.get('title','untitled')}]"
+        return 'UnknownAttachmentType'
+
 
     def _get_student_email(self, user_id: str) -> Optional[str]:
         """Helper to get student email from their profile ID."""
@@ -240,20 +284,23 @@ class Grader:
                 coursework = next((a for a in assignments if a.get('id') == coursework_id), None)
                 if coursework:
                     logger.info(f"Fetched assignment title: {coursework.get('title')}")
+                    self.current_assignment = coursework
+                    logger.debug(f"Set current_assignment: {json.dumps(coursework, indent=2)}")
                 else:
                     logger.warning(f"Could not find assignment with id {coursework_id} in course {course_id}.")
             except Exception as e:
                 logger.warning(f"Could not fetch assignment title for coursework_id {coursework_id}: {e}")
 
             submissions = self.classroom_service.list_submissions(course_id, coursework_id)
+            logger.debug(f"RAW submissions payload: {json.dumps(submissions, indent=2)}")
         except APIError as e:
             logger.critical(f"Failed to list submissions for assignment {coursework_id}: {e}. Aborting processing.")
             return []
 
-        assignment_title = coursework.get('title') if coursework else None
         logger.info(f"Found {len(submissions)} submissions to process.")
 
         for i, sub in enumerate(submissions):
+            logger.debug(f"Submission payload: {json.dumps(sub, indent=2)}")
             submission_id = sub.get('id')
             user_id = sub.get('userId')
             state = sub.get('state')
@@ -270,7 +317,7 @@ class Grader:
                 'error': None,
                 'state': state,
                 'current_grade': assigned_grade,
-                'assignment_title': assignment_title
+                'assignment_title': coursework.get('title') if coursework else None
             }
 
             result['student_email'] = self._get_student_email(user_id)
